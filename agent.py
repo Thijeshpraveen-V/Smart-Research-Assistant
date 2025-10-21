@@ -8,14 +8,18 @@ from langchain_groq import ChatGroq
 from langchain_tavily import TavilySearch
 from langchain_core.prompts import PromptTemplate
 from langchain.agents import AgentExecutor, create_react_agent
-from flask import Flask, render_template, request, make_response
+from flask import Flask, render_template, request, make_response, session, redirect, url_for
 from langchain.callbacks.base import BaseCallbackHandler
+from langchain.memory import ConversationBufferMemory
+from langchain_core.messages import HumanMessage, AIMessage
 import pdfkit
 import sqlite3
 import markdown2
 
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)  # Required for session management
+
 # Load API keys from the .env file
 load_dotenv()
 
@@ -36,19 +40,16 @@ class MyCustomCallbackHandler(BaseCallbackHandler):
     def get_log(self) -> str:
         """Return the captured log."""
         return self.log
-# --- LLM INITIALIZATION FOR HUGGING FACE ---
 
+# --- LLM INITIALIZATION ---
 llm = ChatGroq(model="moonshotai/kimi-k2-instruct-0905", temperature=0)
-
 
 # Define the set of tools the agent can use
 search_tool = TavilySearch(max_results=5)
 tools = [search_tool]
 
-# This is the prompt template that instructs the agent
-# In app.py
-
-prompt = PromptTemplate.from_template(
+# Initial research prompt (for main topics)
+initial_research_prompt = PromptTemplate.from_template(
     """
     You are a hyper-competent academic research assistant. Your mission is to provide a concise summary and a list of papers from elite academic sources.
 
@@ -77,17 +78,52 @@ prompt = PromptTemplate.from_template(
     Thought:{agent_scratchpad}
     """
 )
-# 1. Create the Agent
-agent = create_react_agent(llm, tools, prompt)
 
-# 2. Create the Agent Executor
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=False, handle_parsing_errors=True)
+# Follow-up question prompt (for contextual questions)
+followup_prompt = PromptTemplate.from_template(
+    """
+    You are a helpful research assistant answering follow-up questions based on previous research.
+
+    **PREVIOUS CONVERSATION:**
+    {chat_history}
+
+    **INSTRUCTIONS:**
+    1. Use the previous conversation context to answer the user's follow-up question.
+    2. Provide detailed, informative answers WITHOUT searching for new papers or providing new links.
+    3. If you need additional information, perform a focused web search, but do NOT list academic papers or links in your response.
+    4. Keep your answer conversational, detailed, and directly address the user's question.
+    5. Do NOT include paper links, citations, or bibliographies unless specifically asked.
+
+    You have access to the following tools:
+    {tools}
+
+    Use the following format:
+    Question: {input}
+    Thought: Your reasoning here...
+    Action: The action to take, should be one of [{tool_names}]
+    Action Input: The input to the action
+    Observation: The result of the action
+    ... (This sequence can repeat)
+    Thought: I now have enough information to answer the question.
+    Final Answer: [Your conversational answer without paper links]
+
+    Begin!
+    Question: {input}
+    Thought:{agent_scratchpad}
+    """
+)
 
 # --- FLASK ROUTES ---
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
-        # Load the entire conversation history from the database
+    # Initialize session memory if it doesn't exist
+    if 'conversation_memory' not in session:
+        session['conversation_memory'] = []
+    if 'current_conversation' not in session:
+        session['current_conversation'] = []
+    
+    # Load the entire conversation history from the database
     conn = sqlite3.connect('conversation_history.db')
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -95,23 +131,41 @@ def index():
     chat_history = cursor.fetchall()
     conn.close()
 
-
-    final_answer = None
-    thinking_process = None
-    query = None
-
     if request.method == 'POST':
         query = request.form['query']
+        is_followup = request.form.get('is_followup', 'false') == 'true'
         
-        # This is the magic part: we capture the stdout (print statements)
-        # from the agent's execution to display the "thinking" process
+        # Format chat history for the agent
+        chat_history_str = ""
+        for msg in session['conversation_memory'][-6:]:  # Last 3 exchanges
+            role = "Human" if msg['role'] == 'user' else "Assistant"
+            chat_history_str += f"{role}: {msg['content']}\n"
+        
         # Create an instance of our custom handler
         handler = MyCustomCallbackHandler()
         
-        # Invoke the agent, passing the handler in the config
-        # The handler will automatically capture the logs
+        # Choose prompt based on whether it's a follow-up
+        if is_followup and len(session['conversation_memory']) > 0:
+            agent = create_react_agent(llm, tools, followup_prompt)
+        else:
+            agent = create_react_agent(llm, tools, initial_research_prompt)
+            # Clear current conversation for new topic
+            session['current_conversation'] = []
+        
+        # Create agent executor for this request
+        agent_executor = AgentExecutor(
+            agent=agent, 
+            tools=tools, 
+            verbose=False, 
+            handle_parsing_errors=True
+        )
+        
+        # Invoke the agent with chat history
         result = agent_executor.invoke(
-            {"input": query},
+            {
+                "input": query,
+                "chat_history": chat_history_str
+            },
             config={"callbacks": [handler]}
         )
 
@@ -119,6 +173,7 @@ def index():
         thinking_process = handler.get_log()
         final_answer = result["output"]
 
+        # Store in database
         conn = sqlite3.connect('conversation_history.db')
         cursor = conn.cursor()
         cursor.execute("INSERT INTO history (role, content) VALUES (?, ?)", ('user', query))
@@ -126,7 +181,17 @@ def index():
         conn.commit()
         conn.close()
 
-         # Reload history to include the new messages for immediate display
+        # Update session memory
+        session['conversation_memory'].append({'role': 'user', 'content': query})
+        session['conversation_memory'].append({'role': 'assistant', 'content': final_answer})
+        
+        # Update current conversation (for display)
+        session['current_conversation'].append({'role': 'user', 'content': query})
+        session['current_conversation'].append({'role': 'assistant', 'content': final_answer})
+        
+        session.modified = True
+
+        # Reload history
         conn = sqlite3.connect('conversation_history.db')
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -136,11 +201,17 @@ def index():
 
     return render_template(
         'index.html', 
-        query=query, 
-        thinking_process=thinking_process, 
-        final_answer=final_answer,
-        chat_history=chat_history
+        chat_history=chat_history,
+        current_conversation=session.get('current_conversation', []),
+        has_conversation=len(session.get('current_conversation', [])) > 0
     )
+
+@app.route('/clear_memory', methods=['POST'])
+def clear_memory():
+    """Clear the conversation memory for a fresh start"""
+    session['conversation_memory'] = []
+    session['current_conversation'] = []
+    return redirect(url_for('index'))
 
 @app.route('/download_pdf', methods=['POST'])
 def download_pdf():
@@ -154,22 +225,22 @@ def download_pdf():
         <title>Research Report</title>
         <style>
             body {{
-                font-family: Georgia, serif; /* Use a classic, readable serif font */
-                font-size: 12pt;             /* Increase base font size */
-                line-height: 1.5;            /* Improve line spacing for readability */
+                font-family: Georgia, serif;
+                font-size: 12pt;
+                line-height: 1.5;
                 color: #333;
             }}
             h1, h2, h3 {{
-                font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; /* Use a clean sans-serif for headings */
+                font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
                 color: #2c3e50;
                 border-bottom: 2px solid #ecf0f1;
                 padding-bottom: 10px;
             }}
             img {{
-                max-width: 90%; /* Ensure images don't overflow the page */
+                max-width: 90%;
                 height: auto;
                 display: block;
-                margin: 20px auto; /* Center images */
+                margin: 20px auto;
             }}
             a {{
                 color: #2980b9;
@@ -187,12 +258,9 @@ def download_pdf():
     </html>
     """
 
-    # Convert the HTML string to a PDF
-    # The 'enable-local-file-access' option is important for images
     options = {'enable-local-file-access': None}
     pdf = pdfkit.from_string(html_content, False, options=options)
 
-    # Create a response to send the PDF file to the browser
     response = make_response(pdf)
     response.headers['Content-Type'] = 'application/pdf'
     response.headers['Content-Disposition'] = 'attachment; filename=research_report.pdf'
@@ -210,10 +278,8 @@ def download_history(message_id):
     conn.close()
 
     if message and message['role'] == 'assistant':
-        # Convert the stored Markdown content to HTML
         html_from_markdown = markdown2.markdown(message['content'])
 
-        # Create the full, styled HTML document for the PDF
         pdf_html_content = f"""
         <!DOCTYPE html>
         <html>
